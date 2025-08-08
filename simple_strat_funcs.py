@@ -759,3 +759,1121 @@ def run_strategy_with_params(forecasts, test_implied_vol, r_base, r_term,
         
 
     return cash, trading_portfolio_value, total_portfolio_value, cum_trading_pnl, positions, cash_no_trades, sharpe, max_dd, calmar, cagr
+
+
+
+class Hedging_Trading_Strategy:
+    '''
+    One option/underlying contract is 100_000 units.
+    '''
+
+    def __init__(self, 
+                forecasts: np.ndarray, 
+                test_implied_vol: np.ndarray, 
+                test_vol_smile: pd.DataFrame,
+                initial_capital: float, 
+                r_base: np.ndarray, 
+                r_term: np.ndarray, 
+                spot_price: np.ndarray, 
+                length_of_option: float, 
+                long_thresh: float, 
+                short_thresh: float,
+                overnight_domestic_rate: np.ndarray, 
+                signal_strength: np.ndarray, 
+                signal_multiplier: float, 
+                signal_strength_lb: float, 
+                signal_strength_up: float, 
+                base_notional_option: int    # max amount to trade
+                ) -> None:
+        
+        self.forecasts = forecasts
+        self.test_implied_vol = test_implied_vol
+        self.initial_capital = initial_capital
+        self.r_base = r_base
+        self.r_term = r_term
+        self.spot_price = spot_price
+        self.length_of_option = length_of_option
+        self.long_thresh = long_thresh
+        self.short_thresh = short_thresh
+        self.overnight_domestic_rate = overnight_domestic_rate
+        self.signal_strength = signal_strength
+        self.signal_multiplier = signal_multiplier
+        self.signal_strength_lb = signal_strength_lb
+        self.signal_strength_up = signal_strength_up
+        self.base_notional_option = base_notional_option
+        self.test_vol_smile = test_vol_smile
+
+        self.trading_summary = {
+            'Time': [],
+            'Notional Adjusted': [],
+            'Enter Option Trade Size': [],
+            'Strike Prices': [],
+            'Option Positions': [], 
+            'Total Number of Trades': 0, 
+            'Enter Hedge Price': []}
+        
+        N = len(self.forecasts)
+
+        self.option_delta_position = np.zeros(N + 1)  # total delta position of the option at time t (scaled by notional adjusted)
+        self.option_delta_position[0] = 0.0
+
+        self.total_hedge_position = np.zeros(N + 1)  # total delta hedge position at time t
+        self.total_hedge_position[0] = 0.0
+
+        self.total_adjustments = np.zeros(N + 1)  # total adjustments to delta hedge at time t
+        self.total_adjustments[0] = 0.0
+
+        self.adjustment_cashflow = np.zeros(N + 1)  # cash flow from adjustments to delta hedge at time t
+        self.adjustment_cashflow[0] = 0.0
+
+        self.MM_V = np.zeros(N + 1)  # money market account value at time t
+        self.MM_V[0] = self.initial_capital
+
+        self.V = np.zeros(N + 1)  # total portfolio value at time t
+        self.V[0] = self.initial_capital
+
+        self.trading_V = np.zeros(N + 1)  # trading portfolio value at time t (mtm)
+        self.trading_V[0] = 0.0
+
+        self.hedge_carry = np.zeros(N + 1)  # hedge carry at time t
+        self.hedge_carry[0] = 0.0
+
+        self.daily_option_pnl_mtm = np.zeros(N + 1)
+        self.daily_option_pnl_mtm[0] = 0.0
+
+        self.daily_hedge_pnl_mtm = np.zeros(N + 1)
+        self.daily_hedge_pnl_mtm[0] = 0.0
+
+        self.daily_option_pnl_real = np.zeros(N + 1)
+        self.daily_option_pnl_real[0] = 0.0
+
+        self.option_mtm_value = np.zeros(N + 1) # keep track of mtm for mtm daily profit on options
+        self.option_mtm_value[0] = 0.0
+
+    def get_option_value(self, t,  vol, spot, r_b, r_t, K, type='call'):
+
+        eps = 1e-300
+
+        d1 = (np.log(spot / K) + (r_t - r_b + 0.5 * vol**2) * (self.length_of_option - t)) \
+                    / (vol * np.sqrt(self.length_of_option - t) + eps)
+        
+        d2 = d1 - vol * np.sqrt(self.length_of_option - t)
+
+        if type == 'call':
+            theta = 1
+        elif type == 'put':
+            theta = -1
+        else:
+            raise ValueError("Option type must be 'call' or 'put'.")
+        
+        option_value = theta * (spot * np.exp(-r_b * (self.length_of_option - t)) * 
+                        norm.cdf(theta * d1) - K * np.exp(-r_t * (self.length_of_option - t)) * 
+                        norm.cdf(theta * d2))
+        
+        return option_value
+    
+    def get_straddle_value(self, t, vol, spot, r_b, r_t, K):
+        '''
+        Here t is time in years since we brought the option ie what the option is worth at time t. 
+        '''
+
+        call_value = self.get_option_value(t, vol, spot, r_b, r_t, K, type='call')
+        put_value = self.get_option_value(t, vol, spot, r_b, r_t, K, type='put')
+
+        straddle_value = call_value + put_value
+
+        return straddle_value
+    
+    def enter_straddle(self, tilde_vol_t, spot_t, r_b_t, r_t_t, K, remain_option_duration, signal_strength):
+        '''
+        Computes the total premium to enter a long straddle position at t, how large the entry position size is given adjusted notional
+        value determined from signal strength.
+        '''
+        
+        unit_straddle_value = self.get_straddle_value(self.length_of_option - remain_option_duration,
+                                                  tilde_vol_t, spot_t, r_b_t, r_t_t, K) 
+
+        signal_strength_bounded = np.clip(signal_strength, self.signal_strength_lb, self.signal_strength_up)  
+        notional_adjusted = self.base_notional_option * signal_strength_bounded
+
+        enter_trade_size = notional_adjusted * unit_straddle_value  # total cash value of the trade
+
+        return enter_trade_size, notional_adjusted, unit_straddle_value
+
+    def exit_straddle(self, notional_adjusted, tilde_vol_t, spot_t, r_b_t, r_t_t, K, remain_option_duration):
+        '''
+        Signal strength here needs to be same one as we used to open the trade.
+        '''
+
+        unit_straddle_value = self.get_straddle_value(self.length_of_option - remain_option_duration,
+                                                  tilde_vol_t, spot_t, r_b_t, r_t_t, K)
+        
+        exit_trade_size = notional_adjusted * unit_straddle_value
+
+        return exit_trade_size, unit_straddle_value
+
+
+    def accumulator_mm(self, idx, capital_left, overnight_rate_term):
+        '''
+        Accumulate capital not used for trading in money market account which earns at the overnight term rate (domestic)
+        ie the domestic rate which for USDSGD is SGD. Lets cash acrue overnight. 
+        '''
+
+        res = capital_left * (1 + overnight_rate_term)  
+
+        return res
+    
+    def compute_portfolio_value_with_no_trades(self):
+
+        V_no_trades = np.zeros(len(self.forecasts) + 1)  
+        V_no_trades[0] = self.initial_capital
+
+        for t in range(1, len(self.forecasts) + 1):
+            overnight_dom_r_t = self.overnight_domestic_rate.iloc[t-1]
+            V_no_trades[t] = V_no_trades[t-1] * (1 + overnight_dom_r_t)  
+
+        return V_no_trades
+    
+    def get_delta_of_european(self, t, vol, spot, r_b, r_t, K, type='call'):
+        '''
+        Compute delta of a single call or put option at time t.
+        '''
+
+        eps = 1e-300
+
+        d1 = (np.log(spot / K) + (r_t - r_b + 0.5 * vol**2) * (self.length_of_option - t)) \
+                    / (vol * np.sqrt(self.length_of_option - t) + eps)
+        
+        if type == 'call':
+            delta = np.exp(-r_b * (self.length_of_option - t)) * norm.cdf(d1)
+        elif type == 'put':
+            delta = np.exp(-r_b * (self.length_of_option - t)) * (norm.cdf(d1) - 1)
+        else:
+            raise ValueError("Option type must be 'call' or 'put'.")
+        
+        return delta
+    
+    def get_delta_of_straddle(self, t, vol, spot, r_b, r_t, K):
+        '''
+        Compute delta of a straddle at time t by summing individual deltas - ie this is long short is negative.
+        '''
+
+        call_delta = self.get_delta_of_european(t, vol, spot, r_b, r_t, K, type='call')
+        put_delta = self.get_delta_of_european(t, vol, spot, r_b, r_t, K, type='put')
+
+        unit_straddle_delta = call_delta + put_delta
+
+        return unit_straddle_delta
+    
+
+    def get_delta_hedge_size(self, t, vol, spot, r_b, r_t, K, notional_adjusted):
+        '''
+        Computes the size of the delta hedge at time t given the notional. Returns delta size to match notional of the option
+        given we are long the straddle - minus for short. 
+        '''
+
+        unit_straddle_delta = self.get_delta_of_straddle(t, vol, spot, r_b, r_t, K)
+
+        delta_hedge_size = notional_adjusted * unit_straddle_delta
+
+        return delta_hedge_size
+    
+    def open_long_position(self, idx, spot_t, overnight_dom_r_t, tilde_vol_t, r_b_t, r_t_t, signal_strength_t):
+        '''
+        This function does all the calculations needed to open a long position in a straddle. We update position, option duration, and all portfolio
+        values accordingly. Keep track of trade details for closure and hedging. 
+        '''
+
+        self.trading_summary['Time'].append(idx)
+
+        position = 1
+        self.trading_summary['Option Positions'].append(position)
+        remain_option_duration = self.length_of_option  # reset option duration
+
+        K = spot_t
+        self.trading_summary['Strike Prices'].append(K)
+
+        # carry cash from overnight
+        self.MM_V[idx] = self.accumulator_mm(idx, self.MM_V[idx-1], overnight_dom_r_t)
+
+        total_trade_size, notional_adjusted, unit_straddle_value = self.enter_straddle(
+            tilde_vol_t = tilde_vol_t,
+            spot_t = spot_t,
+            r_b_t = r_b_t,
+            r_t_t = r_t_t,
+            K = K,
+            remain_option_duration = remain_option_duration,
+            signal_strength = signal_strength_t)
+
+        self.trading_summary['Notional Adjusted'].append(notional_adjusted)
+        self.trading_summary['Enter Option Trade Size'].append(total_trade_size)
+
+        self.hedge_carry[idx] = 0.0  # no carry at start
+        self.option_delta_position[idx] = 0.0 # delta neutral at start for ATM straddle
+        self.total_hedge_position[idx] = 0.0  # no hedge position at start
+        self.total_adjustments[idx] = 0.0 
+        self.adjustment_cashflow[idx] = 0.0
+
+        self.MM_V[idx] -= total_trade_size  # deduct cost of trade from cash
+        self.trading_V[idx] = total_trade_size  
+        self.V[idx] = self.MM_V[idx] + self.trading_V[idx]  
+
+        self.daily_hedge_pnl_mtm[idx] = 0.0
+        self.option_mtm_value[idx] = total_trade_size
+        self.daily_option_pnl_mtm[idx] = 0.0
+        self.daily_option_pnl_real[idx] = 0.0 
+
+        print(f"Time {idx}: Long straddle initiated with trade size {total_trade_size:.2f}, notional adjusted {notional_adjusted:.2f}. Total cash available {self.MM_V[idx]:.2f}")
+
+        self.trading_summary['Total Number of Trades'] += 1  
+
+        return position, remain_option_duration
+
+    def open_short_position(self, idx, spot_t, overnight_dom_r_t, tilde_vol_t, r_b_t, r_t_t, signal_strength_t):
+        '''
+        Same as above but for short straddle.
+        '''
+
+        self.trading_summary['Time'].append(idx)
+
+        position = -1
+        self.trading_summary['Option Positions'].append(position)
+        remain_option_duration = self.length_of_option  # reset option duration
+
+        K = spot_t
+        self.trading_summary['Strike Prices'].append(K)
+
+        # carry cash from overnight
+        self.MM_V[idx] = self.accumulator_mm(idx, self.MM_V[idx-1], overnight_dom_r_t)
+
+        total_trade_size, notional_adjusted, unit_straddle_value = self.enter_straddle(
+            tilde_vol_t = tilde_vol_t,
+            spot_t = spot_t,
+            r_b_t = r_b_t,
+            r_t_t = r_t_t,
+            K = K,
+            remain_option_duration = remain_option_duration,
+            signal_strength = signal_strength_t)
+
+        self.trading_summary['Notional Adjusted'].append(notional_adjusted)
+        self.trading_summary['Enter Option Trade Size'].append(total_trade_size)
+
+        self.hedge_carry[idx] = 0.0
+        self.option_delta_position[idx] = 0.0 # delta neutral at start for ATM straddle
+        self.total_hedge_position[idx] = 0.0
+        self.total_adjustments[idx] = 0.0
+        self.adjustment_cashflow[idx] = 0.0
+
+        self.MM_V[idx] += total_trade_size  # add cash from entering short position
+        self.trading_V[idx] = -total_trade_size  # negative value for short position
+        self.V[idx] = self.MM_V[idx] + self.trading_V[idx]
+
+        self.daily_hedge_pnl_mtm[idx] = 0.0
+        self.option_mtm_value[idx] = -total_trade_size
+        self.daily_option_pnl_mtm[idx] = 0.0
+        self.daily_option_pnl_real[idx] = 0.0
+
+        print(f"Time {idx}: Short straddle initiated with trade size {total_trade_size:.2f}, notional adjusted {notional_adjusted:.2f}. Total cash available {self.MM_V[idx]:.2f}") 
+        
+        self.trading_summary['Total Number of Trades'] += 1  
+
+        return position, remain_option_duration
+    
+    def get_vol_smile_strikes(self, vol_smile_t, spot_t, r_b_t, r_t_t):
+        '''
+        Get the vol smile in terms of strikes so we can compare to the option strikes we have entered at. 
+        '''
+
+        deltas = pd.to_numeric(vol_smile_t.index, errors='coerce')
+        strikes = np.zeros_like(deltas)
+        tau = self.length_of_option
+
+        for i, delta in enumerate(deltas):
+
+            vol = vol_smile_t.iloc[i]
+
+            if np.isnan(delta):
+                inv_term = np.exp(r_b_t * tau) * -0.5 + 1
+                term1 = norm.ppf(inv_term)
+                exp_term = (term1 * vol * np.sqrt(tau)) - ((r_t_t - r_b_t + 0.5 * vol**2) * tau)
+                strike_put = spot_t / np.exp(exp_term)
+
+                inv_term = np.exp(r_b_t * tau) * 0.5
+                term1 = norm.ppf(inv_term)
+                exp_term = (term1 * vol * np.sqrt(tau)) - ((r_t_t - r_b_t + 0.5 * vol**2) * tau)
+                strike_call = spot_t / np.exp(exp_term)
+
+                strikes[i] = (strike_put + strike_call) / 2  
+
+
+            elif delta < 0:
+                inv_term = np.exp(r_b_t * tau) * delta + 1
+                term1 = norm.ppf(inv_term)
+                exp_term = (term1 * vol * np.sqrt(tau)) - ((r_t_t - r_b_t + 0.5 * vol**2) * tau)
+                strikes[i] = spot_t / np.exp(exp_term)
+            
+            elif delta > 0:
+                inv_term = np.exp(r_b_t * tau) * delta
+                term1 = norm.ppf(inv_term)
+                exp_term = (term1 * vol * np.sqrt(tau)) - ((r_t_t - r_b_t + 0.5 * vol**2) * tau)
+                strikes[i] = spot_t / np.exp(exp_term)
+
+        vols = vol_smile_t.values
+        strike_smile = pd.Series(vols, index=strikes)
+
+        return strike_smile
+    
+    def get_interpolated_vol(self, vol_smile_strikes_t, k_bar):
+        '''
+        Get interpolated value from cubic spline and interpolate linearly if outside range. 
+        '''
+
+        spline = CubicSpline(x = vol_smile_strikes_t.index, y = vol_smile_strikes_t.values, bc_type='natural', extrapolate=False)
+        result = spline(k_bar)
+
+        if not np.isnan(result):
+
+            return result
+        else:
+            linear = interp1d(x = vol_smile_strikes_t.index, y = vol_smile_strikes_t.values, kind = 'linear', bounds_error=False, fill_value='extrapolate')
+            linear_result = linear(k_bar)
+
+            return linear_result
+        
+    def exit_long_position_signal(self, idx, vol_smile_t, spot_t, r_b_t, r_t_t, overnight_dom_r_t, remain_option_duration):
+        '''
+        Exit a long straddle position given the signal is no longer valid.
+        '''
+
+        position = 0
+        self.trading_summary['Time'].append(idx)
+        self.trading_summary['Option Positions'].append(position)
+
+        # carry cash from overnight
+        self.MM_V[idx] = self.accumulator_mm(idx, self.MM_V[idx-1], overnight_dom_r_t)
+
+        last_notional_adjusted = self.trading_summary['Notional Adjusted'][-1]
+        last_enter_trade_size = self.trading_summary['Enter Option Trade Size'][-1]
+        last_strike = self.trading_summary['Strike Prices'][-1]
+
+        # get the correct implied vols from the smile
+        vol_smile_strikes = self.get_vol_smile_strikes(
+                                                    vol_smile_t=vol_smile_t,
+                                                    spot_t=spot_t,
+                                                    r_b_t=r_b_t,
+                                                    r_t_t=r_t_t)
+        
+        tilde_vol_from_smile = self.get_interpolated_vol(
+            vol_smile_strikes_t=vol_smile_strikes,
+            k_bar=last_strike)
+
+        exit_trade_size, exit_straddle_value = self.exit_straddle(
+            notional_adjusted=last_notional_adjusted,
+            tilde_vol_t=tilde_vol_from_smile,
+            spot_t=spot_t,
+            r_b_t=r_b_t,
+            r_t_t=r_t_t,
+            K=last_strike,
+            remain_option_duration=remain_option_duration)
+        
+        # exit the hedge position as well
+        self.option_delta_position[idx] = 0.0
+
+        self.hedge_carry[idx] = self.total_hedge_position[idx - 1] * self.spot_price[idx-2] * self.r_base.iloc[idx-2] * (1/360)
+        self.total_hedge_position[idx] = - self.option_delta_position[idx]
+        self.total_adjustments[idx] = (self.total_hedge_position[idx] - self.total_hedge_position[idx - 1]) 
+        self.adjustment_cashflow[idx] = -self.total_adjustments[idx] * spot_t + self.hedge_carry[idx]
+
+        self.trading_V[idx] = 0.0
+        self.MM_V[idx] += exit_trade_size + self.adjustment_cashflow[idx]  
+        self.V[idx] = self.MM_V[idx] + self.trading_V[idx]
+
+        print(f"Time {idx}: Long straddle exited with trade size {exit_trade_size:.2f}, notional adjusted {last_notional_adjusted:.2f}. Total cash available {self.MM_V[idx]:.2f}")
+
+        option_pnl = exit_trade_size - last_enter_trade_size
+        self.daily_option_pnl_real[idx] = option_pnl
+        self.option_mtm_value[idx] = exit_trade_size
+        self.daily_option_pnl_mtm[idx] = self.option_mtm_value[idx] - self.option_mtm_value[idx-1]
+
+        print(f"Option PnL for this trade: {option_pnl:.2f}")
+
+        self.daily_hedge_pnl_mtm[idx] = self.total_hedge_position[idx-1] * (spot_t - self.spot_price[idx-2]) 
+
+        self.trading_summary['Enter Option Trade Size'].append(0.0)  # no trade size for exit
+        self.trading_summary['Strike Prices'].append(np.nan)  # no strike price for exit
+        self.trading_summary['Notional Adjusted'].append(0.0)  # no notional adjusted for exit
+
+        return position
+    
+    def exit_short_position_signal(self, idx, vol_smile_t, spot_t, r_b_t, r_t_t, overnight_dom_r_t, remain_option_duration):
+        '''
+        Exit a short straddle position given the signal is no longer valid.
+        '''
+
+        position = 0
+        self.trading_summary['Time'].append(idx)
+        self.trading_summary['Option Positions'].append(position)
+
+        # carry cash from overnight
+        self.MM_V[idx] = self.accumulator_mm(idx, self.MM_V[idx-1], overnight_dom_r_t)
+
+        last_notional_adjusted = self.trading_summary['Notional Adjusted'][-1]
+        last_enter_trade_size = self.trading_summary['Enter Option Trade Size'][-1]
+        last_strike = self.trading_summary['Strike Prices'][-1]
+
+        #get the correct implied vols from the smile
+        vol_smile_strikes = self.get_vol_smile_strikes(
+                                                    vol_smile_t=vol_smile_t,
+                                                    spot_t=spot_t,
+                                                    r_b_t=r_b_t,
+                                                    r_t_t=r_t_t)
+        
+        tilde_vol_from_smile = self.get_interpolated_vol(
+            vol_smile_strikes_t=vol_smile_strikes,
+            k_bar=last_strike)
+
+        exit_trade_size, exit_straddle_value = self.exit_straddle(
+            notional_adjusted=last_notional_adjusted,
+            tilde_vol_t=tilde_vol_from_smile,
+            spot_t=spot_t,
+            r_b_t=r_b_t,
+            r_t_t=r_t_t,
+            K=last_strike,
+            remain_option_duration=remain_option_duration)
+        
+        self.option_delta_position[idx] = 0.0
+
+        self.hedge_carry[idx] = self.total_hedge_position[idx - 1] * self.spot_price[idx-2] * self.r_base.iloc[idx-2] * (1/360)
+        self.total_hedge_position[idx] = - self.option_delta_position[idx]
+        self.total_adjustments[idx] = (self.total_hedge_position[idx] - self.total_hedge_position[idx - 1]) 
+        self.adjustment_cashflow[idx] = -self.total_adjustments[idx] * spot_t + self.hedge_carry[idx]
+
+        self.trading_V[idx] = 0.0
+        self.MM_V[idx] += -exit_trade_size + self.adjustment_cashflow[idx]
+        self.V[idx] = self.MM_V[idx] + self.trading_V[idx]
+
+        print(f"Time {idx}: Short straddle exited with trade size {exit_trade_size:.2f}, notional adjusted {last_notional_adjusted:.2f}. Total cash available {self.MM_V[idx]:.2f}")
+
+        option_pnl = last_enter_trade_size - exit_trade_size
+        self.daily_option_pnl_real[idx] = option_pnl
+        self.option_mtm_value[idx] = -exit_trade_size
+        self.daily_option_pnl_mtm[idx] = self.option_mtm_value[idx] - self.option_mtm_value[idx-1]
+        print(f"Option PnL for this trade: {option_pnl:.2f}")
+
+        self.daily_hedge_pnl_mtm[idx] = self.total_hedge_position[idx-1] * (spot_t - self.spot_price[idx-2]) 
+        
+        self.trading_summary['Enter Option Trade Size'].append(0.0)  # no trade size for exit
+        self.trading_summary['Strike Prices'].append(np.nan)  # no strike price for exit
+        self.trading_summary['Notional Adjusted'].append(0.0)  # no notional adjusted for exit
+
+        return position
+    
+
+    def exit_long_position_expiry(self, idx, spot_t):
+        
+        position = 0
+        self.trading_summary['Time'].append(idx)
+        self.trading_summary['Option Positions'].append(position)
+
+        # carry cash from overnight
+        self.MM_V[idx] = self.accumulator_mm(idx, self.MM_V[idx-1], self.overnight_domestic_rate.iloc[idx-1])
+
+        last_notional_adjusted = self.trading_summary['Notional Adjusted'][-1]
+        last_enter_trade_size = self.trading_summary['Enter Option Trade Size'][-1]
+        last_strike = self.trading_summary['Strike Prices'][-1]
+
+        call_T = np.maximum(spot_t - last_strike, 0)
+        put_T = np.maximum(last_strike - spot_t, 0)
+
+        exit_trade_size = last_notional_adjusted * (call_T + put_T)
+
+        # exit the hedge position as well
+        self.option_delta_position[idx] = 0.0
+
+        self.hedge_carry[idx] = self.total_hedge_position[idx - 1] * self.spot_price[idx-2] * self.r_base.iloc[idx-2] * (1/360)
+        self.total_hedge_position[idx] = - self.option_delta_position[idx]
+        self.total_adjustments[idx] = (self.total_hedge_position[idx] - self.total_hedge_position[idx - 1]) 
+        self.adjustment_cashflow[idx] = -self.total_adjustments[idx] * spot_t
+
+        self.trading_V[idx] = 0.0
+        self.MM_V[idx] += exit_trade_size + self.adjustment_cashflow[idx]  
+        self.V[idx] = self.MM_V[idx] + self.trading_V[idx]
+
+        print(f"Time {idx}: Long straddle expired with trade size {exit_trade_size:.2f}, notional adjusted {last_notional_adjusted:.2f}. Total cash available {self.MM_V[idx]:.2f}")
+
+        option_pnl = exit_trade_size - last_enter_trade_size
+        self.daily_option_pnl_real[idx] = option_pnl
+        self.option_mtm_value[idx] = exit_trade_size
+        self.daily_option_pnl_mtm[idx] = self.option_mtm_value[idx] - self.option_mtm_value[idx-1]
+        print(f"Option PnL for this trade: {option_pnl:.2f}")
+
+        self.daily_hedge_pnl_mtm[idx] = self.total_hedge_position[idx-1] * (spot_t - self.spot_price[idx-2]) 
+        
+        self.trading_summary['Enter Option Trade Size'].append(0.0)  # no trade size for exit
+        self.trading_summary['Strike Prices'].append(np.nan)  # no strike price for exit
+        self.trading_summary['Notional Adjusted'].append(0.0)  # no notional adjusted for exit
+
+        return position
+
+    def exit_short_position_expiry(self, idx, spot_t):
+
+        position = 0
+
+        self.trading_summary['Time'].append(idx)
+        self.trading_summary['Option Positions'].append(position)
+
+        # carry cash from overnight
+        self.MM_V[idx] = self.accumulator_mm(idx, self.MM_V[idx-1], self.overnight_domestic_rate.iloc[idx-1])
+
+        last_notional_adjusted = self.trading_summary['Notional Adjusted'][-1]
+        last_enter_trade_size = self.trading_summary['Enter Option Trade Size'][-1]
+        last_strike = self.trading_summary['Strike Prices'][-1]
+
+        call_T = np.maximum(spot_t - last_strike, 0)
+        put_T = np.maximum(last_strike - spot_t, 0)
+
+        exit_trade_size = last_notional_adjusted * (call_T + put_T)
+
+        self.option_delta_position[idx] = 0.0
+
+        self.hedge_carry[idx] = self.total_hedge_position[idx - 1] * self.spot_price[idx-2] * self.r_base.iloc[idx-2] * (1/360)
+        self.total_hedge_position[idx] = - self.option_delta_position[idx]
+        self.total_adjustments[idx] = (self.total_hedge_position[idx] - self.total_hedge_position[idx - 1]) 
+        self.adjustment_cashflow[idx] = -self.total_adjustments[idx] * spot_t + self.hedge_carry[idx]
+
+        self.trading_V[idx] = 0.0
+        self.MM_V[idx] += -exit_trade_size + self.adjustment_cashflow[idx]
+        self.V[idx] = self.MM_V[idx] + self.trading_V[idx]
+
+        print(f"Time {idx}: Short straddle expired with trade size {exit_trade_size:.2f}, notional adjusted {last_notional_adjusted:.2f}. Total cash available {self.MM_V[idx]:.2f}")
+
+        option_pnl = last_enter_trade_size - exit_trade_size
+        self.daily_option_pnl_real[idx] = option_pnl
+        self.option_mtm_value[idx] = -exit_trade_size
+        self.daily_option_pnl_mtm[idx] = self.option_mtm_value[idx] - self.option_mtm_value[idx-1]
+        print(f"Option PnL for this trade: {option_pnl:.2f}")
+
+        self.daily_hedge_pnl_mtm[idx] = self.total_hedge_position[idx-1] * (spot_t - self.spot_price[idx-2]) 
+        
+        self.trading_summary['Enter Option Trade Size'].append(0.0)  # no trade size for exit
+        self.trading_summary['Strike Prices'].append(np.nan)  # no strike price for exit
+        self.trading_summary['Notional Adjusted'].append(0.0)  # no notional adjusted for exit
+
+        return position
+
+    def mark_to_market_long_position(self, idx, vol_smile_t, spot_t, r_b_t, r_t_t, remain_option_duration):
+        '''
+        Mark to market a long straddle position at time t given the current market conditions - consider delta hedge as well. 
+        '''
+
+        self.trading_summary['Time'].append(idx)
+        self.trading_summary['Option Positions'].append(1)  # still long position
+
+        self.MM_V[idx] = self.accumulator_mm(idx, self.MM_V[idx-1], self.overnight_domestic_rate.iloc[idx-1])  # carry cash from overnight
+
+        last_notional_adjusted = self.trading_summary['Notional Adjusted'][-1]
+        last_strike = self.trading_summary['Strike Prices'][-1]
+        self.trading_summary['Strike Prices'].append(last_strike)  # keep the last strike price
+
+        last_entry_trade_size = self.trading_summary['Enter Option Trade Size'][-1]
+        self.trading_summary['Enter Option Trade Size'].append(last_entry_trade_size)  
+        self.trading_summary['Notional Adjusted'].append(last_notional_adjusted) 
+
+        #get the correct implied vols from the smile
+        vol_smile_strikes = self.get_vol_smile_strikes(
+                                                    vol_smile_t=vol_smile_t,
+                                                    spot_t=spot_t,
+                                                    r_b_t=r_b_t,
+                                                    r_t_t=r_t_t)
+        
+        tilde_vol_from_smile = self.get_interpolated_vol(
+            vol_smile_strikes_t=vol_smile_strikes,
+            k_bar=last_strike)
+
+        mtm_unit_straddle_value = self.get_straddle_value(
+            t=self.length_of_option - remain_option_duration,
+            vol=tilde_vol_from_smile,
+            spot=spot_t,
+            r_b=r_b_t,
+            r_t=r_t_t,
+            K=last_strike)
+
+        mtm_trade_size = last_notional_adjusted * mtm_unit_straddle_value
+
+        delta_size = self.get_delta_hedge_size(
+            t=self.length_of_option - remain_option_duration,
+            vol=tilde_vol_from_smile,
+            spot=spot_t,
+            r_b=r_b_t,
+            r_t=r_t_t,
+            K=last_strike,
+            notional_adjusted=last_notional_adjusted)
+
+        self.option_delta_position[idx] = delta_size #option delta position is pos value of this as long
+
+        self.hedge_carry[idx] = self.total_hedge_position[idx - 1] * self.spot_price[idx-2] * self.r_base.iloc[idx-2] * (1/360)
+        self.total_hedge_position[idx] = - self.option_delta_position[idx] # hedge is negative of position delta
+        self.total_adjustments[idx] = (self.total_hedge_position[idx] - self.total_hedge_position[idx-1])  
+        self.adjustment_cashflow[idx] = -self.total_adjustments[idx] * spot_t + self.hedge_carry[idx]
+
+        self.trading_V[idx] = mtm_trade_size + (self.total_hedge_position[idx] * spot_t)
+        self.MM_V[idx] += self.adjustment_cashflow[idx]   
+        self.V[idx] = self.MM_V[idx] + self.trading_V[idx] 
+
+        self.daily_option_pnl_real[idx] = 0.0
+
+        self.option_mtm_value[idx] = mtm_trade_size
+        self.daily_option_pnl_mtm[idx] = self.option_mtm_value[idx] - self.option_mtm_value[idx-1]
+
+        self.daily_hedge_pnl_mtm[idx] = self.total_hedge_position[idx-1] * (spot_t - self.spot_price[idx-2]) 
+
+    def mark_to_market_short_position(self, idx, vol_smile_t, spot_t, r_b_t, r_t_t, remain_option_duration):
+        '''
+        Mark to market a long straddle position at time t given the current market conditions - consider delta hedge as well. 
+        '''
+
+        self.trading_summary['Time'].append(idx)
+        self.trading_summary['Option Positions'].append(-1)  # still short position
+
+        self.MM_V[idx] = self.accumulator_mm(idx, self.MM_V[idx-1], self.overnight_domestic_rate.iloc[idx-1])  # carry cash from overnight
+
+        last_notional_adjusted = self.trading_summary['Notional Adjusted'][-1]
+        last_strike = self.trading_summary['Strike Prices'][-1]
+        self.trading_summary['Strike Prices'].append(last_strike)  # keep the last strike price
+
+        last_entry_trade_size = self.trading_summary['Enter Option Trade Size'][-1]
+        self.trading_summary['Enter Option Trade Size'].append(last_entry_trade_size)  
+        self.trading_summary['Notional Adjusted'].append(last_notional_adjusted) 
+
+        #get the correct implied vols from the smile
+        vol_smile_strikes = self.get_vol_smile_strikes(
+                                                    vol_smile_t=vol_smile_t,
+                                                    spot_t=spot_t,
+                                                    r_b_t=r_b_t,
+                                                    r_t_t=r_t_t)
+        
+        tilde_vol_from_smile = self.get_interpolated_vol(
+            vol_smile_strikes_t=vol_smile_strikes,
+            k_bar=last_strike)
+
+        mtm_unit_straddle_value = self.get_straddle_value(
+            t=self.length_of_option - remain_option_duration,
+            vol=tilde_vol_from_smile,
+            spot=spot_t,
+            r_b=r_b_t,
+            r_t=r_t_t,
+            K=last_strike)
+
+        mtm_trade_size = last_notional_adjusted * mtm_unit_straddle_value
+
+        delta_size = self.get_delta_hedge_size(
+            t=self.length_of_option - remain_option_duration,
+            vol=tilde_vol_from_smile,
+            spot=spot_t,
+            r_b=r_b_t,
+            r_t=r_t_t,
+            K=last_strike,
+            notional_adjusted=last_notional_adjusted)
+
+        self.option_delta_position[idx] = -delta_size # minus as we are shorting the straddle
+
+        self.hedge_carry[idx] = self.total_hedge_position[idx - 1] * self.spot_price[idx-2] * self.r_base.iloc[idx-2] * (1/360)
+        self.total_hedge_position[idx] = - self.option_delta_position[idx] # hedge is negative of position delta
+        self.total_adjustments[idx] = (self.total_hedge_position[idx] - self.total_hedge_position[idx-1])  
+        self.adjustment_cashflow[idx] = -self.total_adjustments[idx] * spot_t + self.hedge_carry[idx]
+
+        self.trading_V[idx] = -mtm_trade_size + (self.total_hedge_position[idx] * spot_t)
+        self.MM_V[idx] += self.adjustment_cashflow[idx] 
+        self.V[idx] = self.MM_V[idx] + self.trading_V[idx]
+
+        self.daily_option_pnl_real[idx] = 0.0
+
+        self.option_mtm_value[idx] = -mtm_trade_size
+        self.daily_option_pnl_mtm[idx] = self.option_mtm_value[idx] - self.option_mtm_value[idx-1]
+
+        self.daily_hedge_pnl_mtm[idx] = self.total_hedge_position[idx-1] * (spot_t - self.spot_price[idx-2]) 
+
+    def exit_long_position_end_of_session(self, idx, vol_smile_t, spot_t, r_b_t, r_t_t, remain_option_duration):
+
+        position = 0
+
+        self.trading_summary['Time'].append(idx)
+        self.trading_summary['Option Positions'].append(position)
+
+        # carry cash from overnight
+        self.MM_V[idx] = self.accumulator_mm(idx, self.MM_V[idx-1], self.overnight_domestic_rate.iloc[idx-1])
+
+        last_notional_adjusted = self.trading_summary['Notional Adjusted'][-1]
+        last_enter_trade_size = self.trading_summary['Enter Option Trade Size'][-1]
+        last_strike = self.trading_summary['Strike Prices'][-1]
+
+        #get the correct implied vols from the smile
+        vol_smile_strikes = self.get_vol_smile_strikes(
+                                                    vol_smile_t=vol_smile_t,
+                                                    spot_t=spot_t,
+                                                    r_b_t=r_b_t,
+                                                    r_t_t=r_t_t)
+        
+        tilde_vol_from_smile = self.get_interpolated_vol(
+            vol_smile_strikes_t=vol_smile_strikes,
+            k_bar=last_strike)
+
+        exit_trade_size, exit_straddle_value = self.exit_straddle(
+            notional_adjusted=last_notional_adjusted,
+            tilde_vol_t=tilde_vol_from_smile,
+            spot_t=spot_t,
+            r_b_t=r_b_t,
+            r_t_t=r_t_t,
+            K = last_strike,
+            remain_option_duration=remain_option_duration)
+        
+        # exit the hedge position as well
+        self.option_delta_position[idx] = 0.0
+
+        self.hedge_carry[idx] = self.total_hedge_position[idx - 1] * self.spot_price[idx-2] * self.r_base.iloc[idx-2] * (1/360)
+        self.total_hedge_position[idx] = - self.option_delta_position[idx]
+        self.total_adjustments[idx] = (self.total_hedge_position[idx] - self.total_hedge_position[idx - 1]) 
+        self.adjustment_cashflow[idx] = -self.total_adjustments[idx] * spot_t + self.hedge_carry[idx]
+
+        self.trading_V[idx] = 0.0
+        self.MM_V[idx] += exit_trade_size + self.adjustment_cashflow[idx]  
+        self.V[idx] = self.MM_V[idx] + self.trading_V[idx]
+
+        print(f"Time {idx}: Long straddle exited (end of session) with trade size {exit_trade_size:.2f}, notional adjusted {last_notional_adjusted:.2f}. Total cash available {self.MM_V[idx]:.2f}")
+
+        option_pnl = exit_trade_size - last_enter_trade_size
+        self.daily_option_pnl_real[idx] = option_pnl
+        self.option_mtm_value[idx] = exit_trade_size
+        self.daily_option_pnl_mtm[idx] = self.option_mtm_value[idx] - self.option_mtm_value[idx-1]
+        print(f"Option PnL for this trade: {option_pnl:.2f}")
+
+        self.daily_hedge_pnl_mtm[idx] = self.total_hedge_position[idx-1] * (spot_t - self.spot_price[idx-2]) 
+        
+        self.trading_summary['Enter Option Trade Size'].append(0.0)  # no trade size for exit
+        self.trading_summary['Strike Prices'].append(np.nan)  # no strike price for exit
+        self.trading_summary['Notional Adjusted'].append(0.0)  # no notional adjusted for exit
+
+        return position
+        
+
+    def exit_short_position_end_of_session(self, idx, vol_smile_t, spot_t, r_b_t, r_t_t, remain_option_duration):
+        
+        position = 0
+
+        self.trading_summary['Time'].append(idx)
+        self.trading_summary['Option Positions'].append(position)
+
+        # carry cash from overnight
+        self.MM_V[idx] = self.accumulator_mm(idx, self.MM_V[idx-1], self.overnight_domestic_rate.iloc[idx-1])
+
+        last_notional_adjusted = self.trading_summary['Notional Adjusted'][-1]
+        last_enter_trade_size = self.trading_summary['Enter Option Trade Size'][-1]
+        last_strike = self.trading_summary['Strike Prices'][-1]
+
+        #get the correct implied vols from the smile
+        vol_smile_strikes = self.get_vol_smile_strikes(
+                                                    vol_smile_t=vol_smile_t,
+                                                    spot_t=spot_t,
+                                                    r_b_t=r_b_t,
+                                                    r_t_t=r_t_t)
+        
+        tilde_vol_from_smile = self.get_interpolated_vol(
+            vol_smile_strikes_t=vol_smile_strikes,
+            k_bar=last_strike)
+
+        exit_trade_size, exit_straddle_value = self.exit_straddle(
+            notional_adjusted=last_notional_adjusted,
+            tilde_vol_t=tilde_vol_from_smile,
+            spot_t=spot_t,
+            r_b_t=r_b_t,
+            r_t_t=r_t_t,
+            K = last_strike,
+            remain_option_duration=remain_option_duration)
+        
+        self.option_delta_position[idx] = 0.0
+
+        self.hedge_carry[idx] = self.total_hedge_position[idx - 1] * self.spot_price[idx-2] * self.r_base.iloc[idx-2] * (1/360)
+        self.total_hedge_position[idx] = - self.option_delta_position[idx]
+        self.total_adjustments[idx] = (self.total_hedge_position[idx] - self.total_hedge_position[idx - 1]) 
+        self.adjustment_cashflow[idx] = -self.total_adjustments[idx] * spot_t + self.hedge_carry[idx]
+
+        self.trading_V[idx] = 0.0
+        self.MM_V[idx] += -exit_trade_size + self.adjustment_cashflow[idx]
+        self.V[idx] = self.MM_V[idx] + self.trading_V[idx]
+
+        print(f"Time {idx}: Short straddle exited (end of session) with trade size {exit_trade_size:.2f}, notional adjusted {last_notional_adjusted:.2f}. Total cash available {self.MM_V[idx]:.2f}")
+
+        option_pnl = last_enter_trade_size - exit_trade_size
+        self.daily_option_pnl_real[idx] = option_pnl
+        self.option_mtm_value[idx] = -exit_trade_size
+        self.daily_option_pnl_mtm[idx] = self.option_mtm_value[idx] - self.option_mtm_value[idx-1]
+        print(f"Option PnL for this trade: {option_pnl:.2f}")
+
+        self.daily_hedge_pnl_mtm[idx] = self.total_hedge_position[idx-1] * (spot_t - self.spot_price[idx-2]) 
+        
+        self.trading_summary['Enter Option Trade Size'].append(0.0)  # no trade size for exit
+        self.trading_summary['Strike Prices'].append(np.nan)  # no strike price for exit
+        self.trading_summary['Notional Adjusted'].append(0.0)  # no notional adjusted for exit
+
+        return position
+    
+    def no_position_open(self, idx):
+
+        self.trading_summary['Time'].append(idx)
+        self.trading_summary['Option Positions'].append(0)
+        self.trading_summary['Enter Option Trade Size'].append(0.0)  
+        self.trading_summary['Strike Prices'].append(np.nan)  
+        self.trading_summary['Notional Adjusted'].append(0.0)  
+
+        # no position, just carry cash from overnight
+        self.MM_V[idx] = self.accumulator_mm(idx, self.MM_V[idx-1], self.overnight_domestic_rate.iloc[idx-1])
+
+        self.option_delta_position[idx] = 0.0
+        self.total_hedge_position[idx] = 0.0
+        self.total_adjustments[idx] = 0.0
+        self.adjustment_cashflow[idx] = 0.0
+
+        self.daily_hedge_pnl_mtm[idx] = 0.0
+        self.daily_option_pnl_real[idx] = 0.0
+        self.daily_option_pnl_mtm[idx] = 0.0
+        self.option_mtm_value[idx] = 0.0
+
+        self.trading_V[idx] = 0.0
+        self.V[idx] = self.MM_V[idx] + self.trading_V[idx]
+    
+    def run_strategy(self):
+
+        N = len(self.forecasts)
+
+        position = 0  # 0 = no position, 1 = long straddle, -1 = short straddle
+        remain_option_duration = self.length_of_option
+
+        self.trading_summary['Time'].append(0)
+        self.trading_summary['Notional Adjusted'].append(0)
+        self.trading_summary['Enter Option Trade Size'].append(0)
+        self.trading_summary['Strike Prices'].append(np.nan)
+        self.trading_summary['Option Positions'].append(position)
+
+        for t in range(1, N+1):
+            tilde_vol_t = self.test_implied_vol[t-1]
+            spot_t = self.spot_price[t-1]
+            r_b_t = self.r_base.iloc[t-1]
+            r_t_t = self.r_term.iloc[t-1]
+            forecast_t = self.forecasts[t-1] # forecasted vol for t to t+h to compare to true implied at t
+            overnight_dom_r_t = self.overnight_domestic_rate.iloc[t-1]
+            signal_strength_t = self.signal_strength[t-1] * self.signal_multiplier  
+            vol_smile_t = self.test_vol_smile.iloc[t-1]  
+
+            long_condition = forecast_t >= self.long_thresh * tilde_vol_t
+            short_condition = forecast_t <= self.short_thresh * tilde_vol_t
+            if position == 1 or position == -1:
+                remain_option_duration -= 1 / 360
+
+            if position == 0 and long_condition and t != N: 
+
+                position, remain_option_duration = self.open_long_position(
+                    idx=t,
+                    spot_t=spot_t,
+                    overnight_dom_r_t=overnight_dom_r_t,
+                    tilde_vol_t=tilde_vol_t,
+                    r_b_t=r_b_t,
+                    r_t_t=r_t_t,
+                    signal_strength_t=signal_strength_t)
+                
+            elif position == 0 and short_condition and t != N: 
+
+                position, remain_option_duration = self.open_short_position(
+                    idx=t,
+                    spot_t=spot_t,
+                    overnight_dom_r_t=overnight_dom_r_t,
+                    tilde_vol_t=tilde_vol_t,
+                    r_b_t=r_b_t,
+                    r_t_t=r_t_t,
+                    signal_strength_t=signal_strength_t)
+                
+            elif position == 1 and not long_condition:  
+
+                position = self.exit_long_position_signal(
+                    idx=t,
+                    vol_smile_t=vol_smile_t,
+                    spot_t=spot_t,
+                    r_b_t=r_b_t,
+                    r_t_t=r_t_t,
+                    overnight_dom_r_t=overnight_dom_r_t,
+                    remain_option_duration=remain_option_duration)
+
+
+            elif position == -1 and not short_condition: 
+                
+                position = self.exit_short_position_signal(
+                    idx=t,
+                    vol_smile_t=vol_smile_t,
+                    spot_t=spot_t,
+                    r_b_t=r_b_t,
+                    r_t_t=r_t_t,
+                    overnight_dom_r_t=overnight_dom_r_t,
+                    remain_option_duration=remain_option_duration)
+
+            elif position == 1 and remain_option_duration <= 0:
+
+                position = self.exit_long_position_expiry(
+                    idx=t,
+                    spot_t=spot_t)
+
+            elif position == -1 and remain_option_duration <= 0:
+
+                position = self.exit_short_position_expiry(
+                    idx=t,
+                    spot_t=spot_t)
+            
+            elif position == 1 and remain_option_duration > 0 and t != N:
+                
+                self.mark_to_market_long_position(
+                    idx=t,
+                    vol_smile_t=vol_smile_t,
+                    spot_t=spot_t,
+                    r_b_t=r_b_t,
+                    r_t_t=r_t_t,
+                    remain_option_duration=remain_option_duration)
+            
+            elif position == -1 and remain_option_duration > 0 and t != N:
+                
+                self.mark_to_market_short_position(
+                    idx=t,
+                    vol_smile_t=vol_smile_t,
+                    spot_t=spot_t,
+                    r_b_t=r_b_t,
+                    r_t_t=r_t_t,
+                    remain_option_duration=remain_option_duration)
+
+            elif position == 0: 
+
+                self.no_position_open(idx=t)
+
+            elif position == 1 and t == N: # position open at the end of the trading period
+
+                position = self.exit_long_position_end_of_session(
+                    idx=t,
+                    vol_smile_t=vol_smile_t,
+                    spot_t=spot_t,
+                    r_b_t=r_b_t,
+                    r_t_t=r_t_t,
+                    remain_option_duration=remain_option_duration)
+
+            elif position == -1 and t == N: # position open at the end of the trading period
+
+                position = self.exit_short_position_end_of_session(
+                    idx=t,
+                    vol_smile_t=vol_smile_t,
+                    spot_t=spot_t,
+                    r_b_t=r_b_t,
+                    r_t_t=r_t_t,
+                    remain_option_duration=remain_option_duration)
+
+        print(f"Ensure no long trades active at the end of the trading period: {position == 0}")
+        print(f"Final cash available after all trades: {self.MM_V[-1]:.6f}")
+
+        return self.MM_V, self.trading_V, self.V, self.trading_summary, self.option_delta_position, self.total_hedge_position, self.adjustment_cashflow, self.hedge_carry, self.daily_option_pnl_real, self.daily_option_pnl_mtm, self.daily_hedge_pnl_mtm
+    
+    def performance_summary(self):
+
+        MM_V, T_V, V, _, _, _, _, _, _, _, _  = self.run_strategy()
+
+        print("\n")
+        print("\n")
+
+        print("Performance Summary:")
+        # get portfolio returns
+        returns_V = (V[1:] - V[:-1]) / V[:-1]
+        excess_returns = returns_V - self.overnight_domestic_rate.values
+        sharpe = np.mean(excess_returns) / np.std(excess_returns)
+        sharpe_annualised = sharpe * np.sqrt(252)  
+        print(f"Sharpe Ratio (Annualised): {sharpe_annualised:.6f}")
+
+        rolling_max = np.maximum.accumulate(V)
+        daily_drawdown = V / rolling_max - 1
+        max_daily_drawdown = np.minimum.accumulate(daily_drawdown) # returns min value seen so far
+        print(f"Max Daily Drawdown: {max_daily_drawdown.min() * 100:.6f}%")
+
+        calmar = np.mean(excess_returns) / -max_daily_drawdown.min() * 252
+        print(f"Calmar Ratio: {calmar:.6f}")
+
+        print(f"Daily standard deviation of excess returns (annualised): {np.std(excess_returns) * np.sqrt(252):.6f}")
+
+        # CAGR
+        cagr = (V[-1] / V[0]) ** (1 / (len(V) / 252)) - 1
+        print(f"CAGR: {cagr*100:.6f}%")
+
+        return sharpe_annualised, max_daily_drawdown.min() * 100, calmar, cagr
+
+def run_strategy_with_params(forecasts, test_implied_vol, test_vol_smile, r_base, r_term, 
+                            overnight_domestic_rate, spot_price, long_thresh, short_thresh, signal_strength, length_option=1/12,
+                            initial_capital=1_000_000 , signal_multiplier=1, signal_lb = 0.01, signal_ub = 0.99, plot=False, model_name='BMSM Backtest', 
+                            base_notional=100_000):
+
+    strategy = Hedging_Trading_Strategy(
+        forecasts=forecasts,
+        test_implied_vol=test_implied_vol,
+        test_vol_smile=test_vol_smile,
+        initial_capital=initial_capital,
+        r_base=r_base,
+        r_term=r_term,
+        spot_price=spot_price,
+        length_of_option=length_option,
+        long_thresh=long_thresh,
+        short_thresh=short_thresh,
+        overnight_domestic_rate=overnight_domestic_rate,
+        signal_strength=signal_strength,
+        signal_multiplier=signal_multiplier,
+        signal_strength_lb=signal_lb,
+        signal_strength_up=signal_ub,
+        base_notional_option=base_notional
+    )
+
+    cash, trading_portfolio_value, total_portfolio_value, trading_summary, option_delta_positions, delta_hedge, delta_hedge_cashflows, hedge_carry, daily_option_pnl_real, daily_option_pnl_mtm, daily_hedge_pnl_mtm = strategy.run_strategy()
+    cash_no_trades = strategy.compute_portfolio_value_with_no_trades()
+    sharpe, max_dd, calmar, cagr = strategy.performance_summary()
+
+    if plot:
+        plt.style.use('seaborn-v0_8-dark')
+        plt.figure(figsize=(14, 6))
+        plt.plot(cash, label='Cash with Trading', color='blue')
+        plt.xlabel("Day", fontsize=16)
+        plt.ylabel("Cash Value", fontsize=16)
+        plt.title(f"Total Cash in Domestic Currency over Trading Period - {model_name}", fontsize=22)
+        plt.legend(fontsize = 'xx-large')
+        plt.grid()
+        plt.tight_layout()
+
+        plt.figure(figsize=(14, 6))
+        plt.plot(daily_option_pnl_mtm.cumsum(), label='Option PnL', color='blue')
+        plt.plot(daily_hedge_pnl_mtm.cumsum(), label='Hedge PnL', color='orange')
+        plt.xlabel("Day", fontsize=16)
+        plt.ylabel("Trading PnL", fontsize=16)
+        plt.title(f"Cumulative Mark to Market Trading PnL - {model_name}", fontsize=22)
+        plt.legend(fontsize = 'xx-large')
+        plt.grid()
+        plt.tight_layout()
+
+        plt.figure(figsize=(14, 6))
+        plt.plot(daily_option_pnl_mtm.cumsum(), label='Option PnL MtM', color='orange')
+        plt.plot(daily_option_pnl_real.cumsum(), label='Option PnL Realised', color='blue')
+        plt.xlabel("Day", fontsize=16)
+        plt.ylabel("Trading PnL", fontsize=16)
+        plt.title(f"Cumulative Option Trading PnL - {model_name}", fontsize=22)
+        plt.legend(fontsize = 'xx-large')
+        plt.grid()
+        plt.tight_layout()
+
+        plt.figure(figsize=(14, 6))
+        plt.plot(total_portfolio_value, label='Total Portfolio Value', color='green')
+        plt.plot(cash_no_trades, label='Cash with no Trading', color='red', linestyle='--')
+        plt.xlabel("Day", fontsize=16)
+        plt.ylabel("Total Portfolio Value", fontsize=16)
+        plt.title(f"Total Mark to Market Portfolio Value Over Time - {model_name}", fontsize=22)
+        plt.legend(fontsize = 'xx-large')
+        plt.grid()
+        plt.tight_layout()
+
+
+    return cash, trading_portfolio_value, total_portfolio_value, trading_summary, option_delta_positions, delta_hedge, delta_hedge_cashflows, hedge_carry, daily_option_pnl_real, daily_option_pnl_mtm, daily_hedge_pnl_mtm, sharpe, max_dd, calmar, cagr, cash_no_trades
